@@ -1,6 +1,7 @@
 #include <FS.h>
 #include "WiFi.h"
 #include "ESPAsyncWebServer.h"
+#include "esp_task_wdt.h"
 #include <DNSServer.h>
 #include <ESPmDNS.h>
 #include <Update.h>
@@ -17,9 +18,17 @@
 #endif
 
 
+                     // use SD Card [ true / false ]
+#define USESD false  // a FAT32 formatted SD Card will be used instead of the onboard flash for the storage.
+                     // this requires a board with a sd card slot or a sd card connected.
+
                      // use FatFS not SPIFFS [ true / false ]
 #define USEFAT false // FatFS will be used instead of SPIFFS for the storage filesystem or for larger partitons on boards with more than 4mb flash.
                      // you must select a partition scheme labeled with "FAT" or "FATFS" with this enabled.
+
+                     // use LITTLEFS not SPIFFS [ true / false ]
+#define USELFS false // LITTLEFS will be used instead of SPIFFS for the storage filesystem.
+                     // you must select a partition scheme labeled with "SPIFFS" with this enabled and USEFAT must be false.
 
                     // enable internal goldhen.h [ true / false ]
 #define INTHEN false // goldhen is placed in the app partition to free up space on the storage for other payloads.
@@ -34,6 +43,15 @@
                     // this will not work if the board is a esp32 and the usb control is disabled.
 
 
+                       // enable esp sleep [ true / false ]
+#define ESPSLEEP false // this will put the esp board to sleep after [TIME2SLEEP] minutes
+                       // to wake the board up you will need to reboot the console or unplug/replug the esp board or press the reset button on the board.
+                       
+#if ESPSLEEP
+#define TIME2SLEEP 30 // minutes, the esp will goto sleep after this amount of time passes since boot.
+#endif
+
+
 //-------------------DEFAULT SETTINGS------------------//
 
                        // use config.ini [ true / false ]
@@ -42,7 +60,7 @@
 
 //create access point
 boolean startAP = true;
-String AP_SSID = "kameleon900_ESP32-S2";
+String AP_SSID = "Kme900";
 String AP_PASS = "123456789";
 IPAddress Server_IP(10,1,1,1);
 IPAddress Subnet_Mask(255,255,255,0);
@@ -57,7 +75,7 @@ String WIFI_HOSTNAME = "ps4.local";
 int WEB_PORT = 80;
 
 //Auto Usb Wait(milliseconds)
-int USB_WAIT = 10000;
+int USB_WAIT = 5000;
 
 // Displayed firmware version
 String firmwareVer = "1.00";
@@ -69,12 +87,27 @@ String firmwareVer = "1.00";
 #include "Pages.h"
 #include "jzip.h"
 
+#if USESD
+#include "SD.h"
+#include "SPI.h"
+#define SCK 12   // pins for sd card
+#define MISO 13  // these values are set for the LILYGO TTGO T8 ESP32-S2 board
+#define MOSI 11  // you may need to change these for other boards
+#define SS 10
+#define FILESYS SD 
+#else
 #if USEFAT
 #include "FFat.h"
 #define FILESYS FFat 
 #else
+#if USELFS
+#include <LittleFS.h>
+#define FILESYS LittleFS 
+#else
 #include "SPIFFS.h"
 #define FILESYS SPIFFS 
+#endif
+#endif
 #endif
 
 #if INTHEN
@@ -91,6 +124,7 @@ boolean hasEnabled = false;
 boolean isFormating = false;
 long enTime = 0;
 int ftemp = 70;
+long bootTime = 0;
 File upFile;
 #if defined(CONFIG_IDF_TARGET_ESP32S2) | defined(CONFIG_IDF_TARGET_ESP32S3)
 USBMSC dev;
@@ -253,17 +287,23 @@ void handleFileMan(AsyncWebServerRequest *request) {
   File dir = FILESYS.open("/");
   String output = "<!DOCTYPE html><html><head><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>File Manager</title><link rel=\"stylesheet\" href=\"style.css\"><style>body{overflow-y:auto;} th{border: 1px solid #dddddd; background-color:gray;padding: 8px;}</style><script>function statusDel(fname) {var answer = confirm(\"Are you sure you want to delete \" + fname + \" ?\");if (answer) {return true;} else { return false; }} </script></head><body><br><table id=filetable></table><script>var filelist = ["; 
   int fileCount = 0;
-  File file = dir.openNextFile();
-  while(file){
+  while(dir){
+    File file = dir.openNextFile();
+    if (!file)
+    { 
+      dir.close();
+      break;
+    }
     String fname = String(file.name());
-    if (fname.length() > 0 && !fname.equals("config.ini"))
+    if (fname.length() > 0 && !fname.equals("config.ini") && !file.isDirectory())
     {
       fileCount++;
       fname.replace("|","%7C");fname.replace("\"","%22");
       output += "\"" + fname + "|" + formatBytes(file.size()) + "\",";
     }
     file.close();
-    file = dir.openNextFile();
+    esp_task_wdt_reset();
+    
   }
   if (fileCount == 0)
   {
@@ -281,17 +321,22 @@ void handleDlFiles(AsyncWebServerRequest *request) {
   File dir = FILESYS.open("/");
   String output = "<!DOCTYPE html><html><head><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>File Downloader</title><link rel=\"stylesheet\" href=\"style.css\"><style>body{overflow-y:auto;}</style><script type=\"text/javascript\" src=\"jzip.js\"></script><script>var filelist = ["; 
   int fileCount = 0;
-  File file = dir.openNextFile();
-  while(file){
+  while(dir){
+    File file = dir.openNextFile();
+    if (!file)
+    { 
+      dir.close();
+      break;
+    }
     String fname = String(file.name());
-    if (fname.length() > 0 && !fname.equals("config.ini"))
+    if (fname.length() > 0 && !fname.equals("config.ini") && !file.isDirectory())
     {
       fileCount++;
       fname.replace("\"","%22");
       output += "\"" + fname + "\",";
     }
     file.close();
-    file = dir.openNextFile();
+    esp_task_wdt_reset();
   }
   if (fileCount == 0)
   {
@@ -319,13 +364,18 @@ void handlePayloads(AsyncWebServerRequest *request) {
   output +=  "<a onclick=\"setpayload('goldhen.bin','" + String(INTHEN_NAME) + "','" + String(USB_WAIT) + "')\"><button class=\"btn\">" + String(INTHEN_NAME) + "</button></a>&nbsp;";
 #endif
 
-  File file = dir.openNextFile();
-  while(file){
+  while(dir){
+    File file = dir.openNextFile();
+    if (!file)
+    { 
+      dir.close();
+      break;
+    }
     String fname = String(file.name());
     if (fname.endsWith(".gz")) {
         fname = fname.substring(0, fname.length() - 3);
     }
-    if (fname.length() > 0 && fname.endsWith(".bin"))
+    if (fname.length() > 0 && fname.endsWith(".bin") && !file.isDirectory())
     {
       payloadCount++;
       String fnamev = fname;
@@ -339,7 +389,7 @@ void handlePayloads(AsyncWebServerRequest *request) {
       }
     }
     file.close();
-    file = dir.openNextFile();
+    esp_task_wdt_reset();
   }
 
 #if (!defined(USBCONTROL) | USBCONTROL) && FANMOD
@@ -464,10 +514,15 @@ void handleCacheManifest(AsyncWebServerRequest *request) {
   #if !USBCONTROL
   String output = "CACHE MANIFEST\r\n";
   File dir = FILESYS.open("/");
-  File file = dir.openNextFile();
-  while(file){
+  while(dir){
+    File file = dir.openNextFile();
+    if (!file)
+    { 
+      dir.close();
+      break;
+    }
     String fname = String(file.name());
-    if (fname.length() > 0 && !fname.equals("config.ini"))
+    if (fname.length() > 0 && !fname.equals("config.ini") && !file.isDirectory())
     {
       if (fname.endsWith(".gz")) {
         fname = fname.substring(0, fname.length() - 3);
@@ -475,7 +530,6 @@ void handleCacheManifest(AsyncWebServerRequest *request) {
      output += urlencode(fname) + "\r\n";
     }
      file.close();
-     file = dir.openNextFile();
   }
   if(!instr(output,"index.html\r\n"))
   {
@@ -533,8 +587,12 @@ void handleInfo(AsyncWebServerRequest *request)
   output += "Flash frequency: " + String(flashFreq) + " MHz<br>";
   output += "Flash write mode: " + String((ideMode == FM_QIO ? "QIO" : ideMode == FM_QOUT ? "QOUT" : ideMode == FM_DIO ? "DIO" : ideMode == FM_DOUT ? "DOUT" : "UNKNOWN")) + "<br><hr>";
   output += "###### Storage information ######<br><br>";
-#if USEFAT
+#if USESD
+  output += "Storage Device: SD<br>";
+#elif USEFAT
   output += "Filesystem: FatFs<br>";
+#elif USELFS
+  output += "Filesystem: LittleFS<br>";
 #else
   output += "Filesystem: SPIFFS<br>";
 #endif
@@ -589,7 +647,16 @@ void setup(){
   digitalWrite(usbPin, LOW);
 #endif
 
+
+
+
+#if USESD
+  SPI.begin(SCK, MISO, MOSI, SS);
+  if (FILESYS.begin(SS, SPI)) {
+#else
   if (FILESYS.begin(true)) {
+#endif
+
   #if USECONFIG  
   if (FILESYS.exists("/config.ini")) {
   File iniFile = FILESYS.open("/config.ini", "r");
@@ -863,9 +930,12 @@ void setup(){
 
   server.on("/fant.bin", HTTP_GET, [](AsyncWebServerRequest *request){
    if (ftemp < 55 || ftemp > 85){ftemp = 70;}
-   fan[250] = ftemp; fan[368] = ftemp;
-   AsyncWebServerResponse *response = request->beginResponse_P(200, "application/octet-stream", fan, sizeof(fan));
+   uint8_t *fant = (uint8_t *) malloc(sizeof(uint8_t)*sizeof(fan)); 
+   memcpy_P(fant, fan, sizeof(fan));
+   fant[250] = ftemp; fant[368] = ftemp;
+   AsyncWebServerResponse *response = request->beginResponse_P(200, "application/octet-stream", fant , sizeof(fan));
    request->send(response);
+   free(fant);
   });
 #endif
 
@@ -944,6 +1014,8 @@ void setup(){
   DefaultHeaders::Instance().addHeader("Access-Control-Allow-Origin", "*");
   server.begin();
   //HWSerial.println("HTTP server started");
+
+  bootTime = millis();
 }
 
 
@@ -992,10 +1064,19 @@ void disableUSB()
 
 
 void loop(){
+#if ESPSLEEP
+   if (millis() >= (bootTime + (TIME2SLEEP * 60000)))
+   {
+    //HWSerial.print("Esp sleep");
+    esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH, ESP_PD_OPTION_OFF);
+    esp_deep_sleep_start();
+   }
+#endif
    if (hasEnabled && millis() >= (enTime + 15000))
    {
     disableUSB();
    } 
+#if !USESD   
    if (isFormating)
    {
     //HWSerial.print("Formatting Storage");
@@ -1008,5 +1089,6 @@ void loop(){
     writeConfig();
 #endif
    } 
+#endif
    dnsServer.processNextRequest();
 }
